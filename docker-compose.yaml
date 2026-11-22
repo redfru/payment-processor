@@ -1,0 +1,89 @@
+name: payment-processor
+x-app: &app
+  build: .
+  image: payment-processor:local
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+    API_KEY: ${API_KEY:-local-demo-key}
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.2-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  api:
+    <<: *app
+    command: ["sh", "-ec", "alembic upgrade head && exec uvicorn app.api:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost',8000),2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  webhook:
+    profiles: [test]
+    build:
+      context: .
+      target: webhook
+    command: ["uvicorn", "receiver:app", "--app-dir", "/demo", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost',8080),2).close()"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  tests:
+    profiles: [test]
+    build:
+      context: .
+      target: tests
+    environment: *app-env
+    depends_on:
+      consumer:
+        condition: service_started
+      webhook:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  rabbitdata:
